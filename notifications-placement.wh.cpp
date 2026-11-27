@@ -1,7 +1,7 @@
 // ==WindhawkMod==
-// @id              notifications-placement
-// @name            Customize Windows notifications placement
-// @description     Move notifications to another monitor or another corner of the screen
+// @id              notifications-placement-fork
+// @name            Customize Windows notifications placement - Mouse avoidance
+// @description     Move notifications to an adjacent corner when the mouse approaches
 // @version         1.2.4
 // @author          m417z
 // @github          https://github.com/m417z
@@ -26,6 +26,17 @@
 # Customize Windows notifications placement
 
 Move notifications to another monitor or another corner of the screen.
+
+## Mouse avoidance (local modification)
+
+The notification host is checked every 300 ms. If the cursor is on the same
+monitor and its nearest work-area corner is the current notification corner,
+move to the farther of the two adjacent corners (never to the diagonal).
+The chosen corner is retained until another avoidance move or a settings
+change. The horizontal neighbor wins an exact distance tie. Selecting Center
+on either axis disables mouse avoidance. The monitor, DPI and edge-distance
+settings remain in effect. Automatic animation direction follows the effective
+corner when the Shell next positions the notification on its UI thread.
 
 Only Windows 10 64-bit and Windows 11 are supported.
 
@@ -127,6 +138,7 @@ number when both are configured.
 
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -155,15 +167,114 @@ enum class AnimationDirection {
     fromBottom,
 };
 
-struct {
+struct Settings {
     int monitor;
-    WindhawkUtils::StringSetting monitorInterfaceName;
+    std::wstring monitorInterfaceName;
     HorizontalPlacement horizontalPlacement;
     int horizontalDistanceFromScreenEdge;
     VerticalPlacement verticalPlacement;
     int verticalDistanceFromScreenEdge;
     AnimationDirection animationDirection;
-} g_settings;
+};
+
+Settings g_settings{};
+std::mutex g_settingsMutex;
+
+Settings GetSettings() {
+    std::lock_guard<std::mutex> lock(g_settingsMutex);
+    return g_settings;
+}
+
+// The same HWND is positioned by both explorer.exe and ShellExperienceHost.exe.
+// Store the selected corner on the HWND itself, not in process-local state.
+// Values are small integers (1..4), never cross-process pointers.
+constexpr wchar_t kAvoidanceCornerProp[] =
+    L"Windhawk.notifications-placement-fork.MouseAvoidanceCorner.v1";
+constexpr DWORD kMousePollIntervalMs = 300;
+HANDLE g_mouseStopEvent = nullptr;
+HANDLE g_mouseThread = nullptr;
+
+// Bit 0: right; bit 1: bottom. Flipping one bit selects an adjacent corner.
+enum class Corner : unsigned {
+    topLeft = 0,
+    topRight = 1,
+    bottomLeft = 2,
+    bottomRight = 3,
+};
+
+struct Placement {
+    HorizontalPlacement horizontal;
+    VerticalPlacement vertical;
+};
+
+bool IsCornerPlacement(const Settings& settings) {
+    return settings.horizontalPlacement != HorizontalPlacement::center &&
+           settings.verticalPlacement != VerticalPlacement::center;
+}
+
+Corner ConfiguredCorner(const Settings& settings) {
+    return static_cast<Corner>(
+        (settings.horizontalPlacement == HorizontalPlacement::right ? 1u : 0u) |
+        (settings.verticalPlacement == VerticalPlacement::bottom ? 2u : 0u));
+}
+
+Corner EffectiveCorner(HWND hwnd, const Settings& settings) {
+    ULONG_PTR value = reinterpret_cast<ULONG_PTR>(
+        GetPropW(hwnd, kAvoidanceCornerProp));
+    if (value >= 1 && value <= 4) {
+        return static_cast<Corner>(value - 1);
+    }
+    return ConfiguredCorner(settings);
+}
+
+Placement CornerPlacement(Corner corner) {
+    unsigned bits = static_cast<unsigned>(corner);
+    return {bits & 1u ? HorizontalPlacement::right : HorizontalPlacement::left,
+            bits & 2u ? VerticalPlacement::bottom : VerticalPlacement::top};
+}
+
+Placement EffectivePlacement(HWND hwnd, const Settings& settings) {
+    if (g_unloading) {
+        return {HorizontalPlacement::right, VerticalPlacement::bottom};
+    }
+    if (!IsCornerPlacement(settings)) {
+        return {settings.horizontalPlacement, settings.verticalPlacement};
+    }
+    return CornerPlacement(EffectiveCorner(hwnd, settings));
+}
+
+POINT CornerPoint(const RECT& area, Corner corner) {
+    unsigned bits = static_cast<unsigned>(corner);
+    return {bits & 1u ? area.right - 1 : area.left,
+            bits & 2u ? area.bottom - 1 : area.top};
+}
+
+double CornerDistanceSquared(POINT cursor, const RECT& area, Corner corner) {
+    POINT point = CornerPoint(area, corner);
+    double dx = static_cast<double>(cursor.x) - point.x;
+    double dy = static_cast<double>(cursor.y) - point.y;
+    return dx * dx + dy * dy;
+}
+
+Corner NearestCorner(POINT cursor, const RECT& area) {
+    // Comparing to the work-area midpoints is equivalent to comparing all
+    // four Euclidean distances. Resolve exact ties toward right/bottom.
+    return static_cast<Corner>(
+        (2LL * cursor.x >= static_cast<long long>(area.left) + area.right - 1
+             ? 1u : 0u) |
+        (2LL * cursor.y >= static_cast<long long>(area.top) + area.bottom - 1
+             ? 2u : 0u));
+}
+
+Corner ChooseAdjacentCorner(Corner current, POINT cursor, const RECT& area) {
+    unsigned bits = static_cast<unsigned>(current);
+    Corner horizontal = static_cast<Corner>(bits ^ 1u);
+    Corner vertical = static_cast<Corner>(bits ^ 2u);
+    return CornerDistanceSquared(cursor, area, horizontal) >=
+                   CornerDistanceSquared(cursor, area, vertical)
+               ? horizontal
+               : vertical;
+}
 
 enum class Target {
     Explorer,
@@ -326,15 +437,17 @@ bool IsTargetCoreWindow(HWND hWnd) {
         return false;
     }
 
-    if (_wcsicmp(GetProcessFileName(processId).c_str(),
-                 L"ShellExperienceHost.exe") != 0) {
-        return false;
-    }
-
     WCHAR szClassName[32];
     if (GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) == 0 ||
         _wcsicmp(szClassName, L"Windows.UI.Core.CoreWindow") != 0) {
         return false;
+    }
+
+    if (processId != GetCurrentProcessId() || g_target != Target::ShellExperienceHost) {
+        if (_wcsicmp(GetProcessFileName(processId).c_str(),
+                     L"ShellExperienceHost.exe") != 0) {
+            return false;
+        }
     }
 
     // The window title is locale-dependent, and unfortunately I didn't find a
@@ -458,7 +571,9 @@ std::vector<HWND> GetCoreWindows() {
         [](HWND hWnd, LPARAM lParam) -> BOOL {
             ENUM_WINDOWS_PARAM& param = *(ENUM_WINDOWS_PARAM*)lParam;
 
-            if (IsTargetCoreWindow(hWnd)) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hWnd, &pid);
+            if (pid == GetCurrentProcessId() && IsTargetCoreWindow(hWnd)) {
                 param.hWnds->push_back(hWnd);
             }
 
@@ -469,7 +584,9 @@ std::vector<HWND> GetCoreWindows() {
     return hWnds;
 }
 
-void AdjustCoreWindowPos(int* x, int* y, int* cx, int* cy) {
+void AdjustCoreWindowPos(HWND hwnd, int* x, int* y, int* cx, int* cy) {
+    const Settings settings = GetSettings();
+    const Placement placement = EffectivePlacement(hwnd, settings);
     Wh_Log(L"Before: %dx%d %dx%d", *x, *y, *cx, *cy);
 
     RECT rc{
@@ -492,15 +609,15 @@ void AdjustCoreWindowPos(int* x, int* y, int* cx, int* cy) {
     HMONITOR destMonitor = nullptr;
 
     if (!g_unloading) {
-        if (*g_settings.monitorInterfaceName.get()) {
+        if (!settings.monitorInterfaceName.empty()) {
             destMonitor = GetMonitorByInterfaceNameSubstr(
-                g_settings.monitorInterfaceName.get());
-        } else if (g_settings.monitor == 0) {
+                settings.monitorInterfaceName.c_str());
+        } else if (settings.monitor == 0) {
             POINT pt;
             GetCursorPos(&pt);
             destMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        } else if (g_settings.monitor >= 1) {
-            destMonitor = GetMonitorById(g_settings.monitor - 1);
+        } else if (settings.monitor >= 1) {
+            destMonitor = GetMonitorById(settings.monitor - 1);
         }
     }
 
@@ -543,25 +660,24 @@ void AdjustCoreWindowPos(int* x, int* y, int* cx, int* cy) {
 
         if (!g_unloading) {
             horizontalDistanceFromScreenEdge =
-                MulDiv(g_settings.horizontalDistanceFromScreenEdge,
+                MulDiv(settings.horizontalDistanceFromScreenEdge,
                        destMonitorDpiX, 96);
             verticalDistanceFromScreenEdge = MulDiv(
-                g_settings.verticalDistanceFromScreenEdge, destMonitorDpiY, 96);
+                settings.verticalDistanceFromScreenEdge, destMonitorDpiY, 96);
         }
     } else {
         CopyRect(&destMonitorWorkArea, &srcMonitorWorkArea);
 
         if (!g_unloading) {
             horizontalDistanceFromScreenEdge =
-                MulDiv(g_settings.horizontalDistanceFromScreenEdge,
+                MulDiv(settings.horizontalDistanceFromScreenEdge,
                        srcMonitorDpiX, 96);
             verticalDistanceFromScreenEdge = MulDiv(
-                g_settings.verticalDistanceFromScreenEdge, srcMonitorDpiY, 96);
+                settings.verticalDistanceFromScreenEdge, srcMonitorDpiY, 96);
         }
     }
 
-    switch (g_unloading ? HorizontalPlacement::right
-                        : g_settings.horizontalPlacement) {
+    switch (placement.horizontal) {
         case HorizontalPlacement::right:
             *x = destMonitorWorkArea.right - *cx -
                  horizontalDistanceFromScreenEdge;
@@ -579,8 +695,7 @@ void AdjustCoreWindowPos(int* x, int* y, int* cx, int* cy) {
             break;
     }
 
-    switch (g_unloading ? VerticalPlacement::bottom
-                        : g_settings.verticalPlacement) {
+    switch (placement.vertical) {
         case VerticalPlacement::bottom:
             *y = destMonitorWorkArea.bottom - *cy -
                  verticalDistanceFromScreenEdge;
@@ -619,21 +734,21 @@ using MonitorFromPoint_t = decltype(&MonitorFromPoint);
 MonitorFromPoint_t MonitorFromPoint_Original;
 HMONITOR WINAPI MonitorFromPoint_Hook(POINT pt, DWORD dwFlags) {
     Wh_Log(L">");
-
     if (g_inCToastCenterExperienceManager_PositionView && !g_unloading &&
         pt.x == 0 && pt.y == 0) {
+        const Settings settings = GetSettings();
         HMONITOR monitor = nullptr;
 
-        if (*g_settings.monitorInterfaceName.get()) {
+        if (!settings.monitorInterfaceName.empty()) {
             monitor = GetMonitorByInterfaceNameSubstr(
-                g_settings.monitorInterfaceName.get());
-        } else if (g_settings.monitor == 0) {
+                settings.monitorInterfaceName.c_str());
+        } else if (settings.monitor == 0) {
             POINT cursorPt;
             GetCursorPos(&cursorPt);
             monitor =
                 MonitorFromPoint_Original(cursorPt, MONITOR_DEFAULTTONEAREST);
-        } else if (g_settings.monitor >= 1) {
-            monitor = GetMonitorById(g_settings.monitor - 1);
+        } else if (settings.monitor >= 1) {
+            monitor = GetMonitorById(settings.monitor - 1);
         }
 
         if (monitor) {
@@ -644,19 +759,21 @@ HMONITOR WINAPI MonitorFromPoint_Hook(POINT pt, DWORD dwFlags) {
     return MonitorFromPoint_Original(pt, dwFlags);
 }
 
-void UpdateAnimationDirectionStyle() {
+void UpdateAnimationDirectionStyle(HWND hwnd) {
+    const Settings settings = GetSettings();
+    const Placement placement = EffectivePlacement(hwnd, settings);
     int angle = 0;
 
     switch (g_unloading ? AnimationDirection::fromRight
-                        : g_settings.animationDirection) {
+                        : settings.animationDirection) {
         case AnimationDirection::automatic:
-            if (g_settings.horizontalPlacement == HorizontalPlacement::center) {
-                if (g_settings.verticalPlacement == VerticalPlacement::bottom) {
+            if (placement.horizontal == HorizontalPlacement::center) {
+                if (placement.vertical == VerticalPlacement::bottom) {
                     angle = 90;
                 } else {
                     angle = -90;
                 }
-            } else if (g_settings.horizontalPlacement ==
+            } else if (placement.horizontal ==
                        HorizontalPlacement::left) {
                 angle = 180;
             }
@@ -805,7 +922,18 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
     if ((uFlags & SWP_NOSIZE) || cx == 0 || cy == 0) {
         Wh_Log(L"Skipping");
         uFlags |= SWP_NOMOVE | SWP_NOSIZE;
-        return original();
+        BOOL ret = original();
+        // The native call may occur just before the next toast is revealed.
+        // XAML access must stay on its owning thread, never the polling thread.
+        if (g_target == Target::ShellExperienceHost &&
+            GetWindowThreadProcessId(hWnd, nullptr) == GetCurrentThreadId()) {
+            try {
+                UpdateAnimationDirectionStyle(hWnd);
+            } catch (...) {
+                Wh_Log(L"Failed to update animation direction");
+            }
+        }
+        return ret;
     }
 
     if (uFlags & SWP_NOMOVE) {
@@ -814,20 +942,18 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
         Y = rc.top;
     }
 
-    if (uFlags & SWP_NOSIZE) {
-        uFlags &= ~SWP_NOSIZE;
-        cx = rc.right - rc.left;
-        cy = rc.bottom - rc.top;
-    }
-
-    AdjustCoreWindowPos(&X, &Y, &cx, &cy);
+    AdjustCoreWindowPos(hWnd, &X, &Y, &cx, &cy);
 
     BOOL ret =
         SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
 
     if (g_target == Target::ShellExperienceHost &&
         GetWindowThreadProcessId(hWnd, nullptr) == GetCurrentThreadId()) {
-        UpdateAnimationDirectionStyle();
+        try {
+            UpdateAnimationDirectionStyle(hWnd);
+        } catch (...) {
+            Wh_Log(L"Failed to update animation direction");
+        }
     }
 
     return ret;
@@ -835,10 +961,149 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
 
 namespace ShellExperienceHost {
 
+void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
+                const Settings& settings) {
+    if (g_unloading || !IsWindowVisible(hwnd) ||
+        !IsCornerPlacement(settings)) {
+        return;
+    }
+
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc) || IsRectEmpty(&rc)) {
+        return;
+    }
+    HMONITOR monitor = MonitorFromRect(&rc, MONITOR_DEFAULTTONULL);
+    if (!monitor || monitor != cursorMonitor) {
+        return;
+    }
+
+    RECT area{};
+    if (!GetMonitorWorkArea(monitor, &area) || IsRectEmpty(&area)) {
+        return;
+    }
+
+    Corner current = EffectiveCorner(hwnd, settings);
+    if (NearestCorner(cursor, area) != current) {
+        return;  // A different corner is nearest: do not move or reset.
+    }
+
+    Corner next = ChooseAdjacentCorner(current, cursor, area);
+    Placement placement = CornerPlacement(next);
+    UINT dpiX = 96, dpiY = 96;
+    GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY);
+    int marginX = MulDiv(settings.horizontalDistanceFromScreenEdge, dpiX, 96);
+    int marginY = MulDiv(settings.verticalDistanceFromScreenEdge, dpiY, 96);
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    int x = placement.horizontal == HorizontalPlacement::right
+                ? area.right - width - marginX : area.left + marginX;
+    int y = placement.vertical == VerticalPlacement::bottom
+                ? area.bottom - height - marginY : area.top + marginY;
+
+    if (x == rc.left && y == rc.top) {
+        return;  // No physical room to move in the selected direction.
+    }
+
+    // Publish the corner first, so even a concurrent Windows placement request
+    // uses the new corner. SetProp is shared by both hooked processes.
+    HANDLE oldCorner = GetPropW(hwnd, kAvoidanceCornerProp);
+    HANDLE newCorner = reinterpret_cast<HANDLE>(
+        static_cast<ULONG_PTR>(next) + 1);
+    if (!SetPropW(hwnd, kAvoidanceCornerProp, newCorner)) {
+        Wh_Log(L"Mouse avoidance: SetProp failed for %p", hwnd);
+        return;
+    }
+
+    // Do not call the hook here: its no-size branch intentionally blocks moves.
+    // ASYNCWINDOWPOS avoids a synchronous wait for the Shell UI thread.
+    if (!SetWindowPos_Original(hwnd, nullptr, x, y, 0, 0,
+                               SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                               SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS)) {
+        if (oldCorner) {
+            SetPropW(hwnd, kAvoidanceCornerProp, oldCorner);
+        } else {
+            RemovePropW(hwnd, kAvoidanceCornerProp);
+        }
+        Wh_Log(L"Mouse avoidance: SetWindowPos failed for %p", hwnd);
+        return;
+    }
+
+    Wh_Log(L"Mouse avoidance: %p corner %u -> %u at (%d,%d)", hwnd,
+           static_cast<unsigned>(current), static_cast<unsigned>(next), x, y);
+}
+
+DWORD WINAPI MouseMonitorThread(void*) {
+    // GetCursorPos, GetWindowRect, and monitor work areas must be in the
+    // same screen-coordinate space, including on mixed-DPI desktops.
+    auto oldDpiContext = SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    while (WaitForSingleObject(g_mouseStopEvent, kMousePollIntervalMs) ==
+           WAIT_TIMEOUT) {
+        if (g_unloading) {
+            break;
+        }
+        const Settings settings = GetSettings();
+        if (!IsCornerPlacement(settings)) {
+            continue;
+        }
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) {
+            continue;
+        }
+        HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL);
+        if (!monitor) {
+            continue;
+        }
+        for (HWND hwnd : GetCoreWindows()) {
+            if (g_unloading) {
+                break;
+            }
+            AvoidMouse(hwnd, cursor, monitor, settings);
+        }
+    }
+    if (oldDpiContext) {
+        SetThreadDpiAwarenessContext(oldDpiContext);
+    }
+    return 0;
+}
+
+void StartMouseMonitor() {
+    if (g_mouseThread || g_unloading) {
+        return;
+    }
+    g_mouseStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_mouseStopEvent) {
+        Wh_Log(L"Mouse avoidance: failed to create stop event");
+        return;
+    }
+    g_mouseThread = CreateThread(nullptr, 0, MouseMonitorThread, nullptr, 0, nullptr);
+    if (!g_mouseThread) {
+        Wh_Log(L"Mouse avoidance: failed to create monitoring thread");
+        CloseHandle(g_mouseStopEvent);
+        g_mouseStopEvent = nullptr;
+    }
+}
+
+void StopMouseMonitor() {
+    if (g_mouseThread) {
+        SetEvent(g_mouseStopEvent);
+        WaitForSingleObject(g_mouseThread, INFINITE);
+        CloseHandle(g_mouseThread);
+        g_mouseThread = nullptr;
+    }
+    if (g_mouseStopEvent) {
+        CloseHandle(g_mouseStopEvent);
+        g_mouseStopEvent = nullptr;
+    }
+}
+
 void ApplySettings() {
     for (HWND hCoreWnd : GetCoreWindows()) {
         Wh_Log(L"Adjusting core window %08X", (DWORD)(ULONG_PTR)hCoreWnd);
 
+        // Reapply the configured starting corner after settings changes, and
+        // remove our cross-process state before unloading the mod.
+        RemovePropW(hCoreWnd, kAvoidanceCornerProp);
         RECT rc;
         if (!GetWindowRect(hCoreWnd, &rc)) {
             continue;
@@ -849,7 +1114,7 @@ void ApplySettings() {
         int cx = rc.right - rc.left;
         int cy = rc.bottom - rc.top;
 
-        AdjustCoreWindowPos(&x, &y, &cx, &cy);
+        AdjustCoreWindowPos(hCoreWnd, &x, &y, &cx, &cy);
 
         SetWindowPos_Original(hCoreWnd, nullptr, x, y, cx, cy,
                               SWP_NOZORDER | SWP_NOACTIVATE);
@@ -884,46 +1149,51 @@ bool HookTwinuiPcshellSymbols() {
 }
 
 void LoadSettings() {
-    g_settings.monitor = Wh_GetIntSetting(L"monitor");
-    g_settings.monitorInterfaceName =
-        WindhawkUtils::StringSetting::make(L"monitorInterfaceName");
+    Settings settings{};
+    settings.monitor = Wh_GetIntSetting(L"monitor");
+    PCWSTR monitorName = Wh_GetStringSetting(L"monitorInterfaceName");
+    settings.monitorInterfaceName = monitorName ? monitorName : L"";
+    Wh_FreeStringSetting(monitorName);
 
     PCWSTR horizontalPlacement = Wh_GetStringSetting(L"horizontalPlacement");
-    g_settings.horizontalPlacement = HorizontalPlacement::right;
+    settings.horizontalPlacement = HorizontalPlacement::right;
     if (wcscmp(horizontalPlacement, L"left") == 0) {
-        g_settings.horizontalPlacement = HorizontalPlacement::left;
+        settings.horizontalPlacement = HorizontalPlacement::left;
     } else if (wcscmp(horizontalPlacement, L"center") == 0) {
-        g_settings.horizontalPlacement = HorizontalPlacement::center;
+        settings.horizontalPlacement = HorizontalPlacement::center;
     }
     Wh_FreeStringSetting(horizontalPlacement);
 
-    g_settings.horizontalDistanceFromScreenEdge =
+    settings.horizontalDistanceFromScreenEdge =
         Wh_GetIntSetting(L"horizontalDistanceFromScreenEdge");
 
     PCWSTR verticalPlacement = Wh_GetStringSetting(L"verticalPlacement");
-    g_settings.verticalPlacement = VerticalPlacement::bottom;
+    settings.verticalPlacement = VerticalPlacement::bottom;
     if (wcscmp(verticalPlacement, L"top") == 0) {
-        g_settings.verticalPlacement = VerticalPlacement::top;
+        settings.verticalPlacement = VerticalPlacement::top;
     } else if (wcscmp(verticalPlacement, L"center") == 0) {
-        g_settings.verticalPlacement = VerticalPlacement::center;
+        settings.verticalPlacement = VerticalPlacement::center;
     }
     Wh_FreeStringSetting(verticalPlacement);
 
-    g_settings.verticalDistanceFromScreenEdge =
+    settings.verticalDistanceFromScreenEdge =
         Wh_GetIntSetting(L"verticalDistanceFromScreenEdge");
 
     PCWSTR animationDirection = Wh_GetStringSetting(L"animationDirection");
-    g_settings.animationDirection = AnimationDirection::automatic;
+    settings.animationDirection = AnimationDirection::automatic;
     if (wcscmp(animationDirection, L"fromLeft") == 0) {
-        g_settings.animationDirection = AnimationDirection::fromLeft;
+        settings.animationDirection = AnimationDirection::fromLeft;
     } else if (wcscmp(animationDirection, L"fromRight") == 0) {
-        g_settings.animationDirection = AnimationDirection::fromRight;
+        settings.animationDirection = AnimationDirection::fromRight;
     } else if (wcscmp(animationDirection, L"fromTop") == 0) {
-        g_settings.animationDirection = AnimationDirection::fromTop;
+        settings.animationDirection = AnimationDirection::fromTop;
     } else if (wcscmp(animationDirection, L"fromBottom") == 0) {
-        g_settings.animationDirection = AnimationDirection::fromBottom;
+        settings.animationDirection = AnimationDirection::fromBottom;
     }
     Wh_FreeStringSetting(animationDirection);
+
+    std::lock_guard<std::mutex> lock(g_settingsMutex);
+    g_settings = settings;
 }
 
 BOOL Wh_ModInit() {
@@ -974,6 +1244,7 @@ void Wh_ModAfterInit() {
 
     if (g_target == Target::ShellExperienceHost) {
         ShellExperienceHost::ApplySettings();
+        ShellExperienceHost::StartMouseMonitor();
     }
 }
 
@@ -983,6 +1254,7 @@ void Wh_ModBeforeUninit() {
     g_unloading = true;
 
     if (g_target == Target::ShellExperienceHost) {
+        ShellExperienceHost::StopMouseMonitor();
         ShellExperienceHost::ApplySettings();
     }
 }
@@ -994,9 +1266,13 @@ void Wh_ModUninit() {
 void Wh_ModSettingsChanged() {
     Wh_Log(L">");
 
+    if (g_target == Target::ShellExperienceHost) {
+        ShellExperienceHost::StopMouseMonitor();
+    }
     LoadSettings();
 
     if (g_target == Target::ShellExperienceHost) {
         ShellExperienceHost::ApplySettings();
+        ShellExperienceHost::StartMouseMonitor();
     }
 }
