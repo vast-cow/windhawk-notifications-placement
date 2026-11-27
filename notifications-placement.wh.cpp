@@ -29,9 +29,13 @@ Move notifications to another monitor or another corner of the screen.
 
 ## Mouse avoidance (local modification)
 
-The notification host is checked every 300 ms. If the cursor is on the same
-monitor and its nearest work-area corner is the current notification corner,
-move to the farther of the two adjacent corners (never to the diagonal).
+Every 300 ms, the mod checks the shortest straight-line distance from the
+cursor to the current notification window rectangle. If the cursor is on the
+same monitor and the distance is at or below **Mouse avoidance distance**,
+the notification moves to the farther of the two adjacent corners.
+The setting defaults to 48 device-independent pixels (DIP) and scales with
+the notification monitor's DPI. With a value of 0, including negative values
+treated as 0, the cursor must be inside or on the edge of the rectangle.
 The chosen corner is retained until another avoidance move or a settings
 change. The horizontal neighbor wins an exact distance tie. Selecting Center
 on either axis disables mouse avoidance. The monitor, DPI and edge-distance
@@ -117,6 +121,11 @@ number when both are configured.
   - center: Center
 - verticalDistanceFromScreenEdge: 0
   $name: Distance from the bottom/top side of the screen
+- mouseAvoidanceDistance: 48
+  $name: Mouse avoidance distance
+  $description: >-
+    Maximum distance from the notification window in device-independent pixels
+    (DIP) at which the notification moves away. Negative values are treated as 0.
 - animationDirection: automatic
   $name: Notification appearance animation direction
   $options:
@@ -136,6 +145,7 @@ number when both are configured.
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/base.h>
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -174,6 +184,7 @@ struct Settings {
     int horizontalDistanceFromScreenEdge;
     VerticalPlacement verticalPlacement;
     int verticalDistanceFromScreenEdge;
+    int mouseAvoidanceDistance;
     AnimationDirection animationDirection;
 };
 
@@ -254,16 +265,6 @@ double CornerDistanceSquared(POINT cursor, const RECT& area, Corner corner) {
     double dx = static_cast<double>(cursor.x) - point.x;
     double dy = static_cast<double>(cursor.y) - point.y;
     return dx * dx + dy * dy;
-}
-
-Corner NearestCorner(POINT cursor, const RECT& area) {
-    // Comparing to the work-area midpoints is equivalent to comparing all
-    // four Euclidean distances. Resolve exact ties toward right/bottom.
-    return static_cast<Corner>(
-        (2LL * cursor.x >= static_cast<long long>(area.left) + area.right - 1
-             ? 1u : 0u) |
-        (2LL * cursor.y >= static_cast<long long>(area.top) + area.bottom - 1
-             ? 2u : 0u));
 }
 
 Corner ChooseAdjacentCorner(Corner current, POINT cursor, const RECT& area) {
@@ -977,20 +978,25 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
         return;
     }
 
+    UINT dpiX = 96, dpiY = 96;
+    GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY);
+    double threshold = settings.mouseAvoidanceDistance * (dpiX / 96.0);
+    double dx = static_cast<double>(cursor.x) -
+                std::clamp(cursor.x, rc.left, rc.right);
+    double dy = static_cast<double>(cursor.y) -
+                std::clamp(cursor.y, rc.top, rc.bottom);
+    if (dx * dx + dy * dy > threshold * threshold) {
+        return;
+    }
+
     RECT area{};
     if (!GetMonitorWorkArea(monitor, &area) || IsRectEmpty(&area)) {
         return;
     }
 
     Corner current = EffectiveCorner(hwnd, settings);
-    if (NearestCorner(cursor, area) != current) {
-        return;  // A different corner is nearest: do not move or reset.
-    }
-
     Corner next = ChooseAdjacentCorner(current, cursor, area);
     Placement placement = CornerPlacement(next);
-    UINT dpiX = 96, dpiY = 96;
-    GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY);
     int marginX = MulDiv(settings.horizontalDistanceFromScreenEdge, dpiX, 96);
     int marginY = MulDiv(settings.verticalDistanceFromScreenEdge, dpiY, 96);
     int width = rc.right - rc.left;
@@ -1178,6 +1184,9 @@ void LoadSettings() {
 
     settings.verticalDistanceFromScreenEdge =
         Wh_GetIntSetting(L"verticalDistanceFromScreenEdge");
+
+    settings.mouseAvoidanceDistance =
+        std::max<int>(0, Wh_GetIntSetting(L"mouseAvoidanceDistance"));
 
     PCWSTR animationDirection = Wh_GetStringSetting(L"animationDirection");
     settings.animationDirection = AnimationDirection::automatic;
