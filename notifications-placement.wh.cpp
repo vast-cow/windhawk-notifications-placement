@@ -133,6 +133,7 @@ number when both are configured.
 
 #undef GetCurrentTime
 
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Data.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
