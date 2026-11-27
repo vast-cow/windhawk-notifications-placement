@@ -46,6 +46,13 @@ Only Windows 10 64-bit and Windows 11 are supported.
 
 ![Screenshot](https://i.imgur.com/4PxMvLg.png)
 
+## Notification transparency
+
+Use **Notification transparency (%)** to adjust the entire notification,
+including its background, text, icons, and buttons. The default of 0 keeps
+the original appearance. Use 50 for half transparency or 100 for full
+transparency. Changes also apply to notifications already on screen.
+
 ## Selecting a monitor
 
 You can select a monitor by its number or by its interface name in the mod
@@ -126,6 +133,11 @@ number when both are configured.
   $description: >-
     Maximum distance from the notification window in device-independent pixels
     (DIP) at which the notification moves away. Negative values are treated as 0.
+- notificationTransparency: 0
+  $name: Notification transparency (%)
+  $description: >-
+    Transparency of the entire notification. 0 keeps the original appearance,
+    50 makes it half transparent, and 100 makes it fully transparent.
 - animationDirection: automatic
   $name: Notification appearance animation direction
   $options:
@@ -141,15 +153,18 @@ number when both are configured.
 
 #undef GetCurrentTime
 
-#include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Data.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/base.h>
 
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -185,6 +200,7 @@ struct Settings {
     VerticalPlacement verticalPlacement;
     int verticalDistanceFromScreenEdge;
     int mouseAvoidanceDistance;
+    int notificationTransparency;
     AnimationDirection animationDirection;
 };
 
@@ -286,7 +302,7 @@ Target g_target;
 
 bool g_inCToastCenterExperienceManager_PositionView;
 
-bool g_customAnimationDirectionApplied;
+thread_local bool g_customAnimationDirectionApplied;
 
 WINUSERAPI UINT WINAPI GetDpiForWindow(HWND hwnd);
 typedef enum MONITOR_DPI_TYPE {
@@ -760,8 +776,7 @@ HMONITOR WINAPI MonitorFromPoint_Hook(POINT pt, DWORD dwFlags) {
     return MonitorFromPoint_Original(pt, dwFlags);
 }
 
-void UpdateAnimationDirectionStyle(HWND hwnd) {
-    const Settings settings = GetSettings();
+int GetAnimationAngle(HWND hwnd, const Settings& settings) {
     const Placement placement = EffectivePlacement(hwnd, settings);
     int angle = 0;
 
@@ -796,23 +811,21 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
             break;
     }
 
-    if (!g_customAnimationDirectionApplied && !angle) {
-        return;
-    }
+    return angle;
+}
 
+FrameworkElement GetToastCenterGrid() {
     auto window = Window::Current();
     if (!window) {
         Wh_Log(L"Failed to get current window");
-        return;
+        return nullptr;
     }
 
-    FrameworkElement windowContent = window.Content().as<FrameworkElement>();
+    auto windowContent = window.Content().try_as<FrameworkElement>();
     if (!windowContent) {
         Wh_Log(L"Failed to get window content");
-        return;
+        return nullptr;
     }
-
-    FrameworkElement launcherFrame = nullptr;
 
     FrameworkElement child = windowContent;
     if ((child = FindChildByClassName(
@@ -827,14 +840,82 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
              FindChildByClassName(child, L"Windows.UI.Xaml.Controls.Grid")) &&
         (child = FindChildByName(child, L"ScrollContentPresenter")) &&
         (child = FindChildByName(child, L"ToastCenterGrid"))) {
-        launcherFrame = child;
+        return child;
     }
 
-    if (!launcherFrame) {
-        Wh_Log(L"Failed to find launcher frame");
+    Wh_Log(L"Failed to find ToastCenterGrid");
+    return nullptr;
+}
+
+struct ToastOpacity {
+    winrt::weak_ref<FrameworkElement> grid;
+    winrt::Windows::Foundation::IInspectable localOpacity;
+    Data::Binding binding{nullptr};
+    double baseOpacity;
+};
+
+std::vector<ToastOpacity>& ToastOpacitiesForCurrentThread() {
+    // The lock protects the map. Only the owning UI thread uses its vector.
+    static std::mutex mutex;
+    static std::unordered_map<DWORD, std::vector<ToastOpacity>> opacities;
+    std::lock_guard lock(mutex);
+    return opacities[GetCurrentThreadId()];
+}
+
+void RestoreToastOpacities() {
+    auto& opacities = ToastOpacitiesForCurrentThread();
+    if (opacities.empty()) {
         return;
     }
 
+    auto property = UIElement::OpacityProperty();
+    auto unsetValue = DependencyProperty::UnsetValue();
+    for (const auto& original : opacities) {
+        if (auto grid = original.grid.get()) {
+            if (original.binding) {
+                grid.SetBinding(property, original.binding);
+            } else if (original.localOpacity == unsetValue) {
+                grid.ClearValue(property);
+            } else {
+                grid.SetValue(property, original.localOpacity);
+            }
+        }
+    }
+    opacities.clear();
+}
+
+void ApplyToastOpacity(const FrameworkElement& grid, int transparency) {
+    auto& opacities = ToastOpacitiesForCurrentThread();
+    std::erase_if(opacities, [](const ToastOpacity& original) {
+        return !original.grid.get();
+    });
+
+    auto property = UIElement::OpacityProperty();
+    double currentBase =
+        winrt::unbox_value<double>(grid.GetAnimationBaseValue(property));
+    auto original = std::find_if(
+        opacities.begin(), opacities.end(),
+        [&](const ToastOpacity& entry) { return entry.grid.get() == grid; });
+    bool firstUpdate = original == opacities.end();
+    if (firstUpdate) {
+        auto expression = grid.GetBindingExpression(property);
+        opacities.push_back({
+            winrt::make_weak(grid),
+            grid.ReadLocalValue(property),
+            expression ? expression.ParentBinding() : nullptr,
+            currentBase,
+        });
+        original = std::prev(opacities.end());
+    }
+
+    double opacity = original->baseOpacity * ((100 - transparency) / 100.0);
+    if (firstUpdate || currentBase != opacity) {
+        grid.Opacity(opacity);
+    }
+}
+
+void UpdateAnimationDirectionStyle(const FrameworkElement& launcherFrame,
+                                   int angle) {
     auto origin = winrt::Windows::Foundation::Point{0.5, 0.5};
 
     bool foundAnyRootGridContent = false;
@@ -896,6 +977,76 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
     g_customAnimationDirectionApplied = (angle != 0);
 }
 
+void UpdateNotificationStyleOnOwnerThread(HWND hwnd) {
+    try {
+        const Settings settings = GetSettings();
+        int transparency = g_unloading ? 0 : settings.notificationTransparency;
+        if (!transparency) {
+            RestoreToastOpacities();
+        }
+
+        int angle = GetAnimationAngle(hwnd, settings);
+        bool updateAnimation = g_customAnimationDirectionApplied || angle != 0;
+        if (!transparency && !updateAnimation) {
+            return;
+        }
+
+        if (auto grid = GetToastCenterGrid()) {
+            // The grid contains both regular and priority toasts, including
+            // children inserted after the window has been positioned.
+            if (transparency) {
+                ApplyToastOpacity(grid, transparency);
+            }
+            if (updateAnimation) {
+                UpdateAnimationDirectionStyle(grid, angle);
+            }
+        }
+    } catch (...) {
+        Wh_Log(L"Failed to update notification style");
+    }
+}
+
+void RefreshNotificationStyle(HWND hwnd) {
+    DWORD processId = 0;
+    DWORD threadId = GetWindowThreadProcessId(hwnd, &processId);
+    if (!threadId || processId != GetCurrentProcessId()) {
+        return;
+    }
+    if (threadId == GetCurrentThreadId()) {
+        UpdateNotificationStyleOnOwnerThread(hwnd);
+        return;
+    }
+
+    static const UINT message = RegisterWindowMessageW(
+        L"Windhawk.notifications-placement-fork.RefreshNotificationStyle");
+    if (!message) {
+        Wh_Log(L"Failed to register notification style message");
+        return;
+    }
+
+    HHOOK hook = SetWindowsHookExW(
+        WH_CALLWNDPROC,
+        [](int code, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (code == HC_ACTION) {
+                auto request = reinterpret_cast<const CWPSTRUCT*>(lParam);
+                if (request->message == message &&
+                    IsTargetCoreWindow(request->hwnd)) {
+                    UpdateNotificationStyleOnOwnerThread(request->hwnd);
+                }
+            }
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        },
+        nullptr, threadId);
+    if (!hook) {
+        Wh_Log(L"Failed to dispatch notification style update");
+        return;
+    }
+
+    // Wait for the UI-thread update, including restoration before unload.
+    SendMessageW(hwnd, message, 0, 0);
+    UnhookWindowsHookEx(hook);
+}
+
 using SetWindowPos_t = decltype(&SetWindowPos);
 SetWindowPos_t SetWindowPos_Original;
 BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
@@ -928,11 +1079,7 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
         // XAML access must stay on its owning thread, never the polling thread.
         if (g_target == Target::ShellExperienceHost &&
             GetWindowThreadProcessId(hWnd, nullptr) == GetCurrentThreadId()) {
-            try {
-                UpdateAnimationDirectionStyle(hWnd);
-            } catch (...) {
-                Wh_Log(L"Failed to update animation direction");
-            }
+            UpdateNotificationStyleOnOwnerThread(hWnd);
         }
         return ret;
     }
@@ -950,11 +1097,7 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
 
     if (g_target == Target::ShellExperienceHost &&
         GetWindowThreadProcessId(hWnd, nullptr) == GetCurrentThreadId()) {
-        try {
-            UpdateAnimationDirectionStyle(hWnd);
-        } catch (...) {
-            Wh_Log(L"Failed to update animation direction");
-        }
+        UpdateNotificationStyleOnOwnerThread(hWnd);
     }
 
     return ret;
@@ -1124,6 +1267,7 @@ void ApplySettings() {
 
         SetWindowPos_Original(hCoreWnd, nullptr, x, y, cx, cy,
                               SWP_NOZORDER | SWP_NOACTIVATE);
+        RefreshNotificationStyle(hCoreWnd);
     }
 }
 
@@ -1187,6 +1331,9 @@ void LoadSettings() {
 
     settings.mouseAvoidanceDistance =
         std::max<int>(0, Wh_GetIntSetting(L"mouseAvoidanceDistance"));
+
+    settings.notificationTransparency =
+        std::clamp<int>(Wh_GetIntSetting(L"notificationTransparency"), 0, 100);
 
     PCWSTR animationDirection = Wh_GetStringSetting(L"animationDirection");
     settings.animationDirection = AnimationDirection::automatic;
