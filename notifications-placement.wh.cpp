@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              notifications-placement-fork
 // @name            Customize Windows notifications placement - Mouse avoidance
-// @description     Move notifications to an adjacent corner when the mouse approaches
+// @description     Move notifications away from the cursor and skip the corner they just left
 // @version         1.2.4
 // @author          m417z
 // @github          https://github.com/m417z
@@ -32,15 +32,21 @@ Move notifications to another monitor or another corner of the screen.
 Every 300 ms, the mod checks the shortest straight-line distance from the
 cursor to the current notification window rectangle. If the cursor is on the
 same monitor and the distance is at or below **Mouse avoidance distance**,
-the notification moves to the farther of the two adjacent corners.
+the notification moves to an adjacent corner.
+
+Each window chooses its first escape independently. It moves to the adjacent
+corner farther from the cursor, with the horizontal neighbor winning an exact
+tie. On later escapes, it skips the corner it just left. For example, after
+moving from bottom-right to bottom-left, it next moves to top-left.
+
 The setting defaults to 48 device-independent pixels (DIP) and scales with
 the notification monitor's DPI. With a value of 0, including negative values
 treated as 0, the cursor must be inside or on the edge of the rectangle.
 The chosen corner is retained until another avoidance move or a settings
-change. The horizontal neighbor wins an exact distance tie. Selecting Center
-on either axis disables mouse avoidance. The monitor, DPI and edge-distance
-settings remain in effect. Automatic animation direction follows the effective
-corner when the Shell next positions the notification on its UI thread.
+change. Selecting Center on either axis disables mouse avoidance. The monitor,
+DPI and edge-distance settings remain in effect. Automatic animation direction
+follows the effective corner when the Shell next positions the notification on
+its UI thread.
 
 Only Windows 10 64-bit and Windows 11 are supported.
 
@@ -198,9 +204,9 @@ Settings GetSettings() {
 
 // The same HWND is positioned by both explorer.exe and ShellExperienceHost.exe.
 // Store the selected corner on the HWND itself, not in process-local state.
-// Values are small integers (1..4), never cross-process pointers.
+// Encode both corners of the last move in a small integer (1..16).
 constexpr wchar_t kAvoidanceCornerProp[] =
-    L"Windhawk.notifications-placement-fork.MouseAvoidanceCorner.v1";
+    L"Windhawk.notifications-placement-fork.MouseAvoidanceCorner.v2";
 constexpr DWORD kMousePollIntervalMs = 300;
 HANDLE g_mouseStopEvent = nullptr;
 HANDLE g_mouseThread = nullptr;
@@ -229,13 +235,24 @@ Corner ConfiguredCorner(const Settings& settings) {
         (settings.verticalPlacement == VerticalPlacement::bottom ? 2u : 0u));
 }
 
-Corner EffectiveCorner(HWND hwnd, const Settings& settings) {
-    ULONG_PTR value = reinterpret_cast<ULONG_PTR>(
-        GetPropW(hwnd, kAvoidanceCornerProp));
-    if (value >= 1 && value <= 4) {
-        return static_cast<Corner>(value - 1);
+struct EscapeMove {
+    Corner from;
+    Corner to;
+};
+
+HANDLE EncodeEscapeMove(Corner from, Corner to) {
+    return reinterpret_cast<HANDLE>(1 + 4 * static_cast<ULONG_PTR>(from) +
+                                    static_cast<ULONG_PTR>(to));
+}
+
+std::optional<EscapeMove> DecodeEscapeMove(HANDLE property) {
+    ULONG_PTR value = reinterpret_cast<ULONG_PTR>(property);
+    if (value < 1 || value > 16) {
+        return std::nullopt;
     }
-    return ConfiguredCorner(settings);
+    --value;
+    return EscapeMove{static_cast<Corner>(value / 4),
+                      static_cast<Corner>(value % 4)};
 }
 
 Placement CornerPlacement(Corner corner) {
@@ -251,7 +268,8 @@ Placement EffectivePlacement(HWND hwnd, const Settings& settings) {
     if (!IsCornerPlacement(settings)) {
         return {settings.horizontalPlacement, settings.verticalPlacement};
     }
-    return CornerPlacement(EffectiveCorner(hwnd, settings));
+    auto move = DecodeEscapeMove(GetPropW(hwnd, kAvoidanceCornerProp));
+    return CornerPlacement(move ? move->to : ConfiguredCorner(settings));
 }
 
 POINT CornerPoint(const RECT& area, Corner corner) {
@@ -267,10 +285,17 @@ double CornerDistanceSquared(POINT cursor, const RECT& area, Corner corner) {
     return dx * dx + dy * dy;
 }
 
-Corner ChooseAdjacentCorner(Corner current, POINT cursor, const RECT& area) {
+Corner ChooseAdjacentCorner(Corner current, POINT cursor, const RECT& area,
+                            std::optional<Corner> cornerToAvoid) {
     unsigned bits = static_cast<unsigned>(current);
     Corner horizontal = static_cast<Corner>(bits ^ 1u);
     Corner vertical = static_cast<Corner>(bits ^ 2u);
+    if (cornerToAvoid == horizontal) {
+        return vertical;
+    }
+    if (cornerToAvoid == vertical) {
+        return horizontal;
+    }
     return CornerDistanceSquared(cursor, area, horizontal) >=
                    CornerDistanceSquared(cursor, area, vertical)
                ? horizontal
@@ -994,8 +1019,11 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
         return;
     }
 
-    Corner current = EffectiveCorner(hwnd, settings);
-    Corner next = ChooseAdjacentCorner(current, cursor, area);
+    HANDLE oldCorner = GetPropW(hwnd, kAvoidanceCornerProp);
+    auto lastMove = DecodeEscapeMove(oldCorner);
+    Corner current = lastMove ? lastMove->to : ConfiguredCorner(settings);
+    auto cornerToAvoid = lastMove ? std::optional{lastMove->from} : std::nullopt;
+    Corner next = ChooseAdjacentCorner(current, cursor, area, cornerToAvoid);
     Placement placement = CornerPlacement(next);
     int marginX = MulDiv(settings.horizontalDistanceFromScreenEdge, dpiX, 96);
     int marginY = MulDiv(settings.verticalDistanceFromScreenEdge, dpiY, 96);
@@ -1012,9 +1040,7 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
 
     // Publish the corner first, so even a concurrent Windows placement request
     // uses the new corner. SetProp is shared by both hooked processes.
-    HANDLE oldCorner = GetPropW(hwnd, kAvoidanceCornerProp);
-    HANDLE newCorner = reinterpret_cast<HANDLE>(
-        static_cast<ULONG_PTR>(next) + 1);
+    HANDLE newCorner = EncodeEscapeMove(current, next);
     if (!SetPropW(hwnd, kAvoidanceCornerProp, newCorner)) {
         Wh_Log(L"Mouse avoidance: SetProp failed for %p", hwnd);
         return;
