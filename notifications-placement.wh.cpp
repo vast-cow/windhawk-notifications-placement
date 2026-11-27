@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              notifications-placement-fork
 // @name            Customize Windows notifications placement - Mouse avoidance
-// @description     Move notifications to an adjacent corner when the mouse approaches
+// @description     Escape to the farther adjacent corner unless it was the last escape destination
 // @version         1.2.4
 // @author          m417z
 // @github          https://github.com/m417z
@@ -32,15 +32,24 @@ Move notifications to another monitor or another corner of the screen.
 Every 300 ms, the mod checks the shortest straight-line distance from the
 cursor to the current notification window rectangle. If the cursor is on the
 same monitor and the distance is at or below **Mouse avoidance distance**,
-the notification moves to the farther of the two adjacent corners.
+the notification escapes to one of the two adjacent corners. If either
+candidate matches the last escape destination, the mod picks the other.
+Otherwise, it picks the candidate farther from the cursor, with the horizontal
+neighbor winning an exact tie.
+
+Windows accepting a move request records the destination by corner name, such
+as bottom-left. Notifications share this history across monitors and window
+recreation. A failed request or unchanged coordinates leave the history intact.
+Changing settings or restarting the mod clears the history.
+
 The setting defaults to 48 device-independent pixels (DIP) and scales with
 the notification monitor's DPI. With a value of 0, including negative values
 treated as 0, the cursor must be inside or on the edge of the rectangle.
 The chosen corner is retained until another avoidance move or a settings
-change. The horizontal neighbor wins an exact distance tie. Selecting Center
-on either axis disables mouse avoidance. The monitor, DPI and edge-distance
-settings remain in effect. Automatic animation direction follows the effective
-corner when the Shell next positions the notification on its UI thread.
+change. Selecting Center on either axis disables mouse avoidance. The monitor,
+DPI and edge-distance settings remain in effect. Automatic animation direction
+follows the effective corner when the Shell next positions the notification on
+its UI thread.
 
 Only Windows 10 64-bit and Windows 11 are supported.
 
@@ -149,6 +158,7 @@ number when both are configured.
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -267,10 +277,17 @@ double CornerDistanceSquared(POINT cursor, const RECT& area, Corner corner) {
     return dx * dx + dy * dy;
 }
 
-Corner ChooseAdjacentCorner(Corner current, POINT cursor, const RECT& area) {
+Corner ChooseAdjacentCorner(Corner current, POINT cursor, const RECT& area,
+                            std::optional<Corner> previousEscapeDestination) {
     unsigned bits = static_cast<unsigned>(current);
     Corner horizontal = static_cast<Corner>(bits ^ 1u);
     Corner vertical = static_cast<Corner>(bits ^ 2u);
+    if (previousEscapeDestination == horizontal) {
+        return vertical;
+    }
+    if (previousEscapeDestination == vertical) {
+        return horizontal;
+    }
     return CornerDistanceSquared(cursor, area, horizontal) >=
                    CornerDistanceSquared(cursor, area, vertical)
                ? horizontal
@@ -963,7 +980,8 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
 namespace ShellExperienceHost {
 
 void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
-                const Settings& settings) {
+                const Settings& settings,
+                std::optional<Corner>& previousEscapeDestination) {
     if (g_unloading || !IsWindowVisible(hwnd) ||
         !IsCornerPlacement(settings)) {
         return;
@@ -995,7 +1013,8 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
     }
 
     Corner current = EffectiveCorner(hwnd, settings);
-    Corner next = ChooseAdjacentCorner(current, cursor, area);
+    Corner next = ChooseAdjacentCorner(current, cursor, area,
+                                       previousEscapeDestination);
     Placement placement = CornerPlacement(next);
     int marginX = MulDiv(settings.horizontalDistanceFromScreenEdge, dpiX, 96);
     int marginY = MulDiv(settings.verticalDistanceFromScreenEdge, dpiY, 96);
@@ -1034,11 +1053,14 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
         return;
     }
 
+    previousEscapeDestination = next;
     Wh_Log(L"Mouse avoidance: %p corner %u -> %u at (%d,%d)", hwnd,
            static_cast<unsigned>(current), static_cast<unsigned>(next), x, y);
 }
 
 DWORD WINAPI MouseMonitorThread(void*) {
+    // The monitor restarts on settings changes, clearing the shared history.
+    std::optional<Corner> previousEscapeDestination;
     // GetCursorPos, GetWindowRect, and monitor work areas must be in the
     // same screen-coordinate space, including on mixed-DPI desktops.
     auto oldDpiContext = SetThreadDpiAwarenessContext(
@@ -1064,7 +1086,7 @@ DWORD WINAPI MouseMonitorThread(void*) {
             if (g_unloading) {
                 break;
             }
-            AvoidMouse(hwnd, cursor, monitor, settings);
+            AvoidMouse(hwnd, cursor, monitor, settings, previousEscapeDestination);
         }
     }
     if (oldDpiContext) {

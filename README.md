@@ -1,6 +1,8 @@
 # Windhawk Notification Placement with Mouse Avoidance
 
-This Windhawk mod lets you choose the monitor and corner for Windows toast notifications. Every 300 ms, the mod checks the shortest straight-line distance from the cursor to the current notification window rectangle. If the cursor is on the same monitor and the distance is at or below the configured limit, the mod moves the notification to the farther of the two adjacent corners.
+This Windhawk mod lets you choose the monitor and corner for Windows toast notifications. Every 300 ms, the mod checks the shortest straight-line distance from the cursor to the current notification window rectangle. If the cursor is on the same monitor and the distance is at or below the configured limit, the notification escapes to one of the two adjacent corners. If either candidate matches the last escape destination, the mod picks the other. Otherwise, it picks the candidate farther from the cursor, with the horizontal neighbor winning an exact tie.
+
+When Windows accepts a move request, the mod records the destination by corner name, such as bottom-left. Notifications share this history across monitors and window recreation. A failed request or unchanged coordinates leave the history intact. Changing settings or restarting the mod clears the history.
 
 ## Install
 
