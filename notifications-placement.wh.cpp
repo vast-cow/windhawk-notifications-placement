@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              notifications-placement-fork
 // @name            Customize Windows notifications placement - Mouse avoidance
-// @description     Move notifications away from the cursor and skip the corner they just left
-// @version         1.2.4
+// @description     Move notifications away from the cursor and align display and dismissal animations with their position
+// @version         1.2.5
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -44,9 +44,14 @@ the notification monitor's DPI. With a value of 0, including negative values
 treated as 0, the cursor must be inside or on the edge of the rectangle.
 The chosen corner is retained until another avoidance move or a settings
 change. Selecting Center on either axis disables mouse avoidance. The monitor,
-DPI and edge-distance settings remain in effect. Automatic animation direction
-follows the effective corner when the Shell next positions the notification on
-its UI thread.
+DPI and edge-distance settings remain in effect.
+
+In Automatic mode, notifications on the left enter from and dismiss to the
+left edge, and notifications on the right use the right edge. This applies as
+soon as a notification moves to another corner. With centered horizontal
+placement, bottom-aligned notifications use the top edge, and other vertical
+placements use the bottom edge. Selecting an edge manually uses that edge
+for both display and dismissal at any position.
 
 Only Windows 10 64-bit and Windows 11 are supported.
 
@@ -133,7 +138,11 @@ number when both are configured.
     Maximum distance from the notification window in device-independent pixels
     (DIP) at which the notification moves away. Negative values are treated as 0.
 - animationDirection: automatic
-  $name: Notification appearance animation direction
+  $name: Notification display and dismissal animation direction
+  $description: >-
+    The edge notifications enter from and dismiss to. Automatic follows the
+    current placement, including after mouse avoidance. Choosing an edge
+    keeps that direction when the notification moves.
   $options:
   - automatic: Automatic
   - fromLeft: From left
@@ -310,8 +319,6 @@ enum class Target {
 Target g_target;
 
 bool g_inCToastCenterExperienceManager_PositionView;
-
-bool g_customAnimationDirectionApplied;
 
 WINUSERAPI UINT WINAPI GetDpiForWindow(HWND hwnd);
 typedef enum MONITOR_DPI_TYPE {
@@ -785,13 +792,86 @@ HMONITOR WINAPI MonitorFromPoint_Hook(POINT pt, DWORD dwFlags) {
     return MonitorFromPoint_Original(pt, dwFlags);
 }
 
+struct AnimationRotation {
+    winrt::weak_ref<FrameworkElement> element;
+    winrt::Windows::Foundation::IInspectable originalTransform;
+    winrt::Windows::Foundation::IInspectable originalOrigin;
+    Media::RotateTransform rotation;
+};
+
+// XAML access stays on the window thread. Weak references let a toast be
+// destroyed normally and let us restore live elements outside the visual tree.
+thread_local std::vector<AnimationRotation> g_animationRotations;
+
+void SetAnimationRotation(const FrameworkElement& element, int angle) {
+    const auto transformProperty = UIElement::RenderTransformProperty();
+    const auto localTransform = element.ReadLocalValue(transformProperty);
+    auto entry = std::find_if(g_animationRotations.begin(),
+                              g_animationRotations.end(), [&](const auto& item) {
+        return item.element.get() == element;
+    });
+    if (entry != g_animationRotations.end() &&
+        localTransform == entry->rotation) {
+        if (entry->rotation.Angle() != angle) {
+            entry->rotation.Angle(angle);
+        }
+        return;
+    }
+    if (entry != g_animationRotations.end()) {
+        g_animationRotations.erase(entry);
+    }
+
+    Media::RotateTransform rotation;
+    rotation.Angle(angle);
+    g_animationRotations.push_back({
+        winrt::make_weak(element),
+        localTransform,
+        element.ReadLocalValue(UIElement::RenderTransformOriginProperty()),
+        rotation,
+    });
+    element.RenderTransform(rotation);
+    element.RenderTransformOrigin({0.5f, 0.5f});
+}
+
+void ClearAnimationRotations() {
+    if (g_animationRotations.empty()) {
+        return;
+    }
+
+    const auto transformProperty = UIElement::RenderTransformProperty();
+    const auto originProperty = UIElement::RenderTransformOriginProperty();
+    const auto unset = DependencyProperty::UnsetValue();
+    for (const auto& entry : g_animationRotations) {
+        auto element = entry.element.get();
+        if (!element ||
+            element.ReadLocalValue(transformProperty) != entry.rotation) {
+            continue;
+        }
+        if (entry.originalTransform == unset) {
+            element.ClearValue(transformProperty);
+        } else {
+            element.SetValue(transformProperty, entry.originalTransform);
+        }
+        if (entry.originalOrigin == unset) {
+            element.ClearValue(originProperty);
+        } else {
+            element.SetValue(originProperty, entry.originalOrigin);
+        }
+    }
+    g_animationRotations.clear();
+}
+
 void UpdateAnimationDirectionStyle(HWND hwnd) {
+    if (g_unloading) {
+        ClearAnimationRotations();
+        return;
+    }
+
     const Settings settings = GetSettings();
     const Placement placement = EffectivePlacement(hwnd, settings);
     int angle = 0;
 
-    switch (g_unloading ? AnimationDirection::fromRight
-                        : settings.animationDirection) {
+    switch (settings.animationDirection) {
         case AnimationDirection::automatic:
             if (placement.horizontal == HorizontalPlacement::center) {
                 if (placement.vertical == VerticalPlacement::bottom) {
@@ -799,8 +879,7 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
                 } else {
                     angle = -90;
                 }
-            } else if (placement.horizontal ==
-                       HorizontalPlacement::left) {
+            } else if (placement.horizontal == HorizontalPlacement::left) {
                 angle = 180;
             }
             break;
@@ -821,9 +900,13 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
             break;
     }
 
-    if (!g_customAnimationDirectionApplied && !angle) {
+    if (!angle) {
+        ClearAnimationRotations();
         return;
     }
+
+    std::erase_if(g_animationRotations,
+                  [](const auto& entry) { return !entry.element.get(); });
 
     auto window = Window::Current();
     if (!window) {
@@ -860,8 +943,6 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
         return;
     }
 
-    auto origin = winrt::Windows::Foundation::Point{0.5, 0.5};
-
     bool foundAnyRootGridContent = false;
     EnumChildElements(launcherFrame, [&](FrameworkElement toastView) {
         auto name = toastView.Name();
@@ -883,11 +964,7 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
                 FindChildByName(mainGrid, L"RevealGrid")) {
             Wh_Log(L"Applying transform to toast view %s", name.c_str());
 
-            Media::RotateTransform transform;
-            transform.Angle(-angle);
-            revealGrid.RenderTransform(transform);
-            revealGrid.RenderTransformOrigin(origin);
-
+            SetAnimationRotation(revealGrid, -angle);
             foundAnyRootGridContent = true;
         }
 
@@ -897,11 +974,7 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
                 FindChildByName(mainGrid, L"RevealGrid2")) {
             Wh_Log(L"Applying transform to toast view %s", name.c_str());
 
-            Media::RotateTransform transform;
-            transform.Angle(-angle);
-            revealGrid2.RenderTransform(transform);
-            revealGrid2.RenderTransformOrigin(origin);
-
+            SetAnimationRotation(revealGrid2, -angle);
             foundAnyRootGridContent = true;
         }
 
@@ -913,12 +986,15 @@ void UpdateAnimationDirectionStyle(HWND hwnd) {
         return;
     }
 
-    Media::RotateTransform transform;
-    transform.Angle(angle);
-    launcherFrame.RenderTransform(transform);
-    launcherFrame.RenderTransformOrigin(origin);
+    SetAnimationRotation(launcherFrame, angle);
+}
 
-    g_customAnimationDirectionApplied = (angle != 0);
+void TryUpdateAnimationDirectionStyle(HWND hwnd) {
+    try {
+        UpdateAnimationDirectionStyle(hwnd);
+    } catch (...) {
+        Wh_Log(L"Failed to update animation direction");
+    }
 }
 
 using SetWindowPos_t = decltype(&SetWindowPos);
@@ -941,45 +1017,26 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
 
     Wh_Log(L"%08X %08X", (DWORD)(ULONG_PTR)hWnd, uFlags);
 
-    RECT rc{};
-    GetWindowRect(hWnd, &rc);
-
     // Skip if no size or empty size.
     if ((uFlags & SWP_NOSIZE) || cx == 0 || cy == 0) {
         Wh_Log(L"Skipping");
         uFlags |= SWP_NOMOVE | SWP_NOSIZE;
-        BOOL ret = original();
-        // The native call may occur just before the next toast is revealed.
-        // XAML access must stay on its owning thread, never the polling thread.
-        if (g_target == Target::ShellExperienceHost &&
-            GetWindowThreadProcessId(hWnd, nullptr) == GetCurrentThreadId()) {
-            try {
-                UpdateAnimationDirectionStyle(hWnd);
-            } catch (...) {
-                Wh_Log(L"Failed to update animation direction");
-            }
+    } else {
+        if (uFlags & SWP_NOMOVE) {
+            RECT rc{};
+            GetWindowRect(hWnd, &rc);
+            uFlags &= ~SWP_NOMOVE;
+            X = rc.left;
+            Y = rc.top;
         }
-        return ret;
+        AdjustCoreWindowPos(hWnd, &X, &Y, &cx, &cy);
     }
 
-    if (uFlags & SWP_NOMOVE) {
-        uFlags &= ~SWP_NOMOVE;
-        X = rc.left;
-        Y = rc.top;
-    }
-
-    AdjustCoreWindowPos(hWnd, &X, &Y, &cx, &cy);
-
-    BOOL ret =
-        SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
-
-    if (g_target == Target::ShellExperienceHost &&
+    BOOL ret = original();
+    // A placement call without a size can precede the next toast's reveal.
+    if (ret && g_target == Target::ShellExperienceHost &&
         GetWindowThreadProcessId(hWnd, nullptr) == GetCurrentThreadId()) {
-        try {
-            UpdateAnimationDirectionStyle(hWnd);
-        } catch (...) {
-            Wh_Log(L"Failed to update animation direction");
-        }
+        TryUpdateAnimationDirectionStyle(hWnd);
     }
 
     return ret;
@@ -987,20 +1044,22 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
 
 namespace ShellExperienceHost {
 
-void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
-                const Settings& settings) {
-    if (g_unloading || !IsWindowVisible(hwnd) ||
-        !IsCornerPlacement(settings)) {
-        return;
+bool TryAvoidMouse(HWND hwnd) {
+    const Settings settings = GetSettings();
+    if (g_unloading || !IsWindowVisible(hwnd) || !IsCornerPlacement(settings)) {
+        return false;
     }
 
+    POINT cursor{};
     RECT rc{};
-    if (!GetWindowRect(hwnd, &rc) || IsRectEmpty(&rc)) {
-        return;
+    if (!GetCursorPos(&cursor) || !GetWindowRect(hwnd, &rc) ||
+        IsRectEmpty(&rc)) {
+        return false;
     }
     HMONITOR monitor = MonitorFromRect(&rc, MONITOR_DEFAULTTONULL);
-    if (!monitor || monitor != cursorMonitor) {
-        return;
+    if (!monitor ||
+        monitor != MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL)) {
+        return false;
     }
 
     UINT dpiX = 96, dpiY = 96;
@@ -1011,12 +1070,12 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
     double dy = static_cast<double>(cursor.y) -
                 std::clamp(cursor.y, rc.top, rc.bottom);
     if (dx * dx + dy * dy > threshold * threshold) {
-        return;
+        return false;
     }
 
     RECT area{};
     if (!GetMonitorWorkArea(monitor, &area) || IsRectEmpty(&area)) {
-        return;
+        return false;
     }
 
     HANDLE oldCorner = GetPropW(hwnd, kAvoidanceCornerProp);
@@ -1035,7 +1094,7 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
                 ? area.bottom - height - marginY : area.top + marginY;
 
     if (x == rc.left && y == rc.top) {
-        return;  // No physical room to move in the selected direction.
+        return false;  // No physical room to move in the selected direction.
     }
 
     // Publish the corner first, so even a concurrent Windows placement request
@@ -1043,32 +1102,114 @@ void AvoidMouse(HWND hwnd, POINT cursor, HMONITOR cursorMonitor,
     HANDLE newCorner = EncodeEscapeMove(current, next);
     if (!SetPropW(hwnd, kAvoidanceCornerProp, newCorner)) {
         Wh_Log(L"Mouse avoidance: SetProp failed for %p", hwnd);
-        return;
+        return false;
     }
 
     // Do not call the hook here: its no-size branch intentionally blocks moves.
-    // ASYNCWINDOWPOS avoids a synchronous wait for the Shell UI thread.
     if (!SetWindowPos_Original(hwnd, nullptr, x, y, 0, 0,
                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
-                               SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS)) {
+                               SWP_NOOWNERZORDER)) {
         if (oldCorner) {
             SetPropW(hwnd, kAvoidanceCornerProp, oldCorner);
         } else {
             RemovePropW(hwnd, kAvoidanceCornerProp);
         }
         Wh_Log(L"Mouse avoidance: SetWindowPos failed for %p", hwnd);
-        return;
+        return false;
     }
 
     Wh_Log(L"Mouse avoidance: %p corner %u -> %u at (%d,%d)", hwnd,
            static_cast<unsigned>(current), static_cast<unsigned>(next), x, y);
+    return true;
+}
+
+void AvoidMouseAndUpdateAnimation(HWND hwnd) {
+    // Keep the cursor, window and work area in the same coordinate space.
+    auto oldDpiContext = SetThreadDpiAwarenessContext(
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    bool moved = TryAvoidMouse(hwnd);
+    if (oldDpiContext) {
+        SetThreadDpiAwarenessContext(oldDpiContext);
+    }
+    if (moved) {
+        TryUpdateAnimationDirectionStyle(hwnd);
+    }
+}
+
+void ApplySettingsToWindow(HWND hwnd) {
+    // Return to the configured starting corner and clear the shared escape
+    // history. During unload, AdjustCoreWindowPos uses the Windows defaults.
+    RemovePropW(hwnd, kAvoidanceCornerProp);
+    RECT rc{};
+    BOOL moved = FALSE;
+    if (GetWindowRect(hwnd, &rc)) {
+        int x = rc.left;
+        int y = rc.top;
+        int cx = rc.right - rc.left;
+        int cy = rc.bottom - rc.top;
+        AdjustCoreWindowPos(hwnd, &x, &y, &cx, &cy);
+        moved = SetWindowPos_Original(hwnd, nullptr, x, y, cx, cy,
+                                      SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (moved || g_unloading) {
+        TryUpdateAnimationDirectionStyle(hwnd);
+    }
+}
+
+enum class WindowAction : WPARAM {
+    avoidMouse,
+    applySettings,
+};
+
+UINT g_windowActionMessage;
+
+void HandleWindowAction(HWND hwnd, WindowAction action) {
+    switch (action) {
+        case WindowAction::avoidMouse:
+            AvoidMouseAndUpdateAnimation(hwnd);
+            break;
+        case WindowAction::applySettings:
+            ApplySettingsToWindow(hwnd);
+            break;
+    }
+}
+
+LRESULT CALLBACK WindowActionHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        const auto* message = reinterpret_cast<const CWPSTRUCT*>(lParam);
+        if (message->message == g_windowActionMessage) {
+            HandleWindowAction(message->hwnd,
+                               static_cast<WindowAction>(message->wParam));
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+void RunWindowAction(HWND hwnd, WindowAction action) {
+    DWORD processId = 0;
+    DWORD threadId = GetWindowThreadProcessId(hwnd, &processId);
+    if (!threadId || processId != GetCurrentProcessId()) {
+        return;
+    }
+    if (threadId == GetCurrentThreadId()) {
+        HandleWindowAction(hwnd, action);
+        return;
+    }
+
+    // The hook handles the registered message on the owning UI thread.
+    // Synchronous delivery keeps the move and transform in the same callback
+    // and leaves no work queued after settings changes or unload.
+    HHOOK hook =
+        SetWindowsHookExW(WH_CALLWNDPROC, WindowActionHook, nullptr, threadId);
+    if (!hook) {
+        Wh_Log(L"Failed to dispatch window action for %p", hwnd);
+        return;
+    }
+    SendMessageW(hwnd, g_windowActionMessage, static_cast<WPARAM>(action), 0);
+    UnhookWindowsHookEx(hook);
 }
 
 DWORD WINAPI MouseMonitorThread(void*) {
-    // GetCursorPos, GetWindowRect, and monitor work areas must be in the
-    // same screen-coordinate space, including on mixed-DPI desktops.
-    auto oldDpiContext = SetThreadDpiAwarenessContext(
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     while (WaitForSingleObject(g_mouseStopEvent, kMousePollIntervalMs) ==
            WAIT_TIMEOUT) {
         if (g_unloading) {
@@ -1078,23 +1219,14 @@ DWORD WINAPI MouseMonitorThread(void*) {
         if (!IsCornerPlacement(settings)) {
             continue;
         }
-        POINT cursor{};
-        if (!GetCursorPos(&cursor)) {
-            continue;
-        }
-        HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL);
-        if (!monitor) {
-            continue;
-        }
         for (HWND hwnd : GetCoreWindows()) {
-            if (g_unloading) {
+            if (WaitForSingleObject(g_mouseStopEvent, 0) == WAIT_OBJECT_0) {
                 break;
             }
-            AvoidMouse(hwnd, cursor, monitor, settings);
+            if (IsWindowVisible(hwnd)) {
+                RunWindowAction(hwnd, WindowAction::avoidMouse);
+            }
         }
-    }
-    if (oldDpiContext) {
-        SetThreadDpiAwarenessContext(oldDpiContext);
     }
     return 0;
 }
@@ -1119,7 +1251,12 @@ void StartMouseMonitor() {
 void StopMouseMonitor() {
     if (g_mouseThread) {
         SetEvent(g_mouseStopEvent);
-        WaitForSingleObject(g_mouseThread, INFINITE);
+        // The monitor may already be sending a message to this thread.
+        while (MsgWaitForMultipleObjects(1, &g_mouseThread, FALSE, INFINITE,
+                                         QS_SENDMESSAGE) == WAIT_OBJECT_0 + 1) {
+            MSG msg{};
+            PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        }
         CloseHandle(g_mouseThread);
         g_mouseThread = nullptr;
     }
@@ -1132,24 +1269,7 @@ void StopMouseMonitor() {
 void ApplySettings() {
     for (HWND hCoreWnd : GetCoreWindows()) {
         Wh_Log(L"Adjusting core window %08X", (DWORD)(ULONG_PTR)hCoreWnd);
-
-        // Reapply the configured starting corner after settings changes, and
-        // remove our cross-process state before unloading the mod.
-        RemovePropW(hCoreWnd, kAvoidanceCornerProp);
-        RECT rc;
-        if (!GetWindowRect(hCoreWnd, &rc)) {
-            continue;
-        }
-
-        int x = rc.left;
-        int y = rc.top;
-        int cx = rc.right - rc.left;
-        int cy = rc.bottom - rc.top;
-
-        AdjustCoreWindowPos(hCoreWnd, &x, &y, &cx, &cy);
-
-        SetWindowPos_Original(hCoreWnd, nullptr, x, y, cx, cy,
-                              SWP_NOZORDER | SWP_NOACTIVATE);
+        RunWindowAction(hCoreWnd, WindowAction::applySettings);
     }
 }
 
@@ -1257,6 +1377,15 @@ BOOL Wh_ModInit() {
                 return FALSE;
             }
             break;
+    }
+
+    if (g_target == Target::ShellExperienceHost) {
+        ShellExperienceHost::g_windowActionMessage = RegisterWindowMessageW(
+            L"Windhawk.notifications-placement-fork.WindowAction");
+        if (!ShellExperienceHost::g_windowActionMessage) {
+            Wh_Log(L"Failed to register notification window action message");
+            return FALSE;
+        }
     }
 
     WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,

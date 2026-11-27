@@ -18,6 +18,8 @@ In the mod’s **Settings** tab, choose a monitor and set the horizontal and ver
 
 **Mouse avoidance distance** defaults to 48 device-independent pixels (DIP). The distance scales with the notification monitor’s DPI, so 48 DIP is 48 screen pixels at 100% scaling and 72 at 150%. A value of `0` triggers avoidance only when the cursor is inside or on the edge of the window rectangle. Negative values are treated as `0`.
 
+**Notification display and dismissal animation direction** defaults to **Automatic**. Notifications enter from and dismiss to the edge on their current side, including after mouse avoidance. Horizontally centered notifications use the top edge when placed at the bottom and the bottom edge at other vertical placements. A manually selected edge applies to both animations wherever the notification is placed.
+
 ## Credits and license
 
 This fork adds mouse avoidance to m417z’s **Customize Windows notifications placement** mod. See the [original source in `ramensoftware/windhawk-mods`](https://github.com/ramensoftware/windhawk-mods/blob/main/mods/notifications-placement.wh.cpp). The mod source is licensed under the GNU General Public License v3.0.
